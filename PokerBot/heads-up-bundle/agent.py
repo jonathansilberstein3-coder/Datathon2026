@@ -29,7 +29,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup  # handy helpers, see evaluator.py
+from evaluator import card_rank, card_suit, cards_to_str, omaha_score, score_five, warmup  # handy helpers, see evaluator.py
 from game import Action, AgentConfig, HandResult, Observation, Street
 
 # Build omaha_score's lookup table now, while the server starts, instead of
@@ -39,8 +39,8 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "TotallyAwesomeDatathonParticipant"
-AGENT_NAME = "JustAsAwesomeAgent"
+PARTICIPANT = "Dead Man's Hand"
+AGENT_NAME = "LuckyCallingStation"
 
 
 # ===== YOUR CODE HERE =====
@@ -56,6 +56,11 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     so nothing you learn in one half carries over to the other half.
     """
     memory["hands_played"] = 0
+    memory["opponent_actions"] = 0
+    memory["opponent_raises"] = 0
+    memory["opponent_calls"] = 0
+    memory["last_hand_index"] = None
+    memory["processed_actions"] = 0
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -86,11 +91,158 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     scores your hand (higher is better).
     """
 
-    # Simple example of a heuristic bot, which just checks when it is of no cost, otherwise folds
-    # Replace this with your strategy!
-    if obs.to_call == 0:
+    def raise_action(preferred: Action) -> Action:
+        if preferred in obs.legal_actions:
+            return preferred
+        if Action.RAISE_HALF in obs.legal_actions:
+            return Action.RAISE_HALF
+        if Action.RAISE_POT in obs.legal_actions:
+            return Action.RAISE_POT
         return Action.CHECK_CALL
-    return Action.FOLD
+
+    # Track only opponent actions seen in the current hand.  The action history
+    # is cumulative, so reset its counter whenever a new hand begins.
+    if memory.get("last_hand_index") != obs.hand_index:
+        memory["last_hand_index"] = obs.hand_index
+        memory["processed_actions"] = 0
+    for action in obs.action_history[memory["processed_actions"]:]:
+        if not action.is_me:
+            memory["opponent_actions"] += 1
+            if action.action == Action.RAISE_HALF or action.action == Action.RAISE_POT:
+                memory["opponent_raises"] += 1
+            elif action.action == Action.CHECK_CALL and action.amount > 0:
+                memory["opponent_calls"] += 1
+    memory["processed_actions"] = len(obs.action_history)
+
+    opponent_actions = memory["opponent_actions"]
+    opponent_call_rate = (
+        memory["opponent_calls"] / opponent_actions if opponent_actions >= 30 else 0.5
+    )
+    opponent_raise_rate = (
+        memory["opponent_raises"] / opponent_actions if opponent_actions >= 30 else 0.5
+    )
+
+    ranks = [card_rank(card) for card in obs.hole_cards]
+    rank_counts = {rank: ranks.count(rank) for rank in set(ranks)}
+    suits = [card_suit(card) for card in obs.hole_cards]
+    suit_counts = {suit: suits.count(suit) for suit in set(suits)}
+    unique_ranks = sorted(set(ranks))
+
+    pair_count = sum(count // 2 for count in rank_counts.values())
+    trip_count = sum(count // 3 for count in rank_counts.values())
+    max_suit_count = max(suit_counts.values(), default=0)
+
+    longest_run = 1
+    run = 1
+    for index in range(1, len(unique_ranks)):
+        if unique_ranks[index] == unique_ranks[index - 1] + 1:
+            run += 1
+            longest_run = max(longest_run, run)
+        else:
+            run = 1
+    wheel_ranks = set(unique_ranks) | {0}
+    if {8, 0, 1, 2, 3}.issubset(wheel_ranks):
+        longest_run = max(longest_run, 5)
+
+    high_cards = sum(rank >= 6 for rank in ranks)
+    preflop_score = (
+        sum(ranks)
+        + 18 * pair_count
+        + 25 * trip_count
+        + 3 * longest_run
+        + 3 * max_suit_count
+        + 3 * high_cards
+    )
+    if obs.is_button:
+        preflop_score += 4
+
+    # Pot odds are the amount paid divided by the total pot after calling.
+    pot_after_call = obs.pot + obs.to_call
+    pot_odds = obs.to_call / pot_after_call if pot_after_call else 0.0
+
+    if obs.street == Street.PREFLOP:
+        if obs.to_call == 0:
+            if preflop_score >= 52:
+                return raise_action(Action.RAISE_POT)
+            if preflop_score >= 38 and obs.is_button:
+                return raise_action(Action.RAISE_HALF)
+            return Action.CHECK_CALL
+
+        if opponent_raise_rate >= 0.75:
+            if preflop_score >= 65:
+                return raise_action(Action.RAISE_POT)
+            if preflop_score >= 50 and pot_odds <= 0.35:
+                return Action.CHECK_CALL
+            return Action.FOLD
+
+        if preflop_score >= 55:
+            return raise_action(Action.RAISE_HALF)
+        if preflop_score >= 42 and pot_odds <= 0.45:
+            return Action.CHECK_CALL
+        if preflop_score >= 34 and pot_odds <= 0.25 and opponent_call_rate >= 0.55:
+            return Action.CHECK_CALL
+        return Action.FOLD
+
+    # Approximate the best Omaha five-card result with the actual cards
+    # available.  On the river, this is the exact evaluator path.
+    best_score = 0
+    hole_pairs = [
+        (first, second)
+        for first in range(len(obs.hole_cards))
+        for second in range(first + 1, len(obs.hole_cards))
+    ]
+    if len(obs.board) == 5:
+        best_score = omaha_score(obs.hole_cards, obs.board)
+    else:
+        board_triples = [
+            (first, second, third)
+            for first in range(len(obs.board))
+            for second in range(first + 1, len(obs.board))
+            for third in range(second + 1, len(obs.board))
+        ]
+        for hole_first, hole_second in hole_pairs:
+            for board_first, board_second, board_third in board_triples:
+                five_cards = (
+                    obs.hole_cards[hole_first],
+                    obs.hole_cards[hole_second],
+                    obs.board[board_first],
+                    obs.board[board_second],
+                    obs.board[board_third],
+                )
+                best_score = max(best_score, score_five(five_cards))
+
+    category = best_score >> 20
+    is_nuts_or_near_nuts = category >= 5
+    is_made_hand = category >= 3
+
+    if obs.to_call > 0:
+        if is_nuts_or_near_nuts:
+            if obs.raises_this_street < 4 and opponent_raise_rate < 0.85:
+                return raise_action(Action.RAISE_POT)
+            return Action.CHECK_CALL
+        if opponent_raise_rate >= 0.75:
+            if category >= 4 and pot_odds <= 0.50:
+                return Action.CHECK_CALL
+            if category == 3 and pot_odds <= 0.25:
+                return Action.CHECK_CALL
+            return Action.FOLD
+        if is_made_hand and pot_odds <= 0.55:
+            return Action.CHECK_CALL
+        if category == 2 and pot_odds <= 0.30:
+            return Action.CHECK_CALL
+        if category == 1 and pot_odds <= 0.18 and opponent_call_rate >= 0.60:
+            return Action.CHECK_CALL
+        return Action.FOLD
+
+    if is_nuts_or_near_nuts:
+        return raise_action(
+            Action.RAISE_POT if obs.street == Street.RIVER else Action.RAISE_HALF
+        )
+    if is_made_hand:
+        return raise_action(Action.RAISE_HALF)
+    if category == 2 and obs.is_button:
+        return raise_action(Action.RAISE_HALF)
+    return Action.CHECK_CALL
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
